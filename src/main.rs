@@ -102,12 +102,11 @@ impl Command {
         };
         Some(answer.to_string())
     }
-    pub fn get_command_path(command: &str, path: &[PathBuf]) -> Option<String> {
-        path.iter().find_map(|p| {
-            let mut path = p.to_owned();
-            path.push(command);
-            if fs::read(&path).is_ok() && is_executable(&path) {
-                Some(path.to_str()?.to_string())
+    pub fn get_command_path(command: &str, paths: &[PathBuf]) -> Option<String> {
+        paths.iter().find_map(|p| {
+            let full_path = p.join(command);
+            if (full_path.is_file() && is_executable(&full_path)) {
+                Some(full_path.to_str()?.to_string())
             } else {
                 None
             }
@@ -124,41 +123,45 @@ fn parse(input: String, path: &[PathBuf]) -> Result<String> {
     let command = command.expect("Command was checked for none right beforehand.");
 
     let response = match command {
-        "echo" => args.fold(String::new(), |mut acc, s| {
-            if !acc.is_empty() {
-                acc.push(' ');
-            }
-            acc.push_str(s.as_ref());
-            acc
-        }),
+        "echo" => args.collect::<Vec<&str>>().join(" "),
         "exit" => exit(0),
-        "type" => match args.next() {
-            Some(a) => Command::is_builtin(a)
-                .or_else(|| Command::get_command_path(a, path).map(|v| format!("{} is {}", a, v)))
-                .unwrap_or_else(|| format!("{}: not found", a)),
-            None => "type: expected an argument of a command name".to_string(),
-        },
+        "type" => args.next().map_or_else(
+            || "type: expected an argument of a command name".to_string(),
+            |cmd| {
+                if let Some(builtin) = Command::is_builtin(cmd) {
+                    builtin.to_string()
+                } else if let Some(path) = Command::get_command_path(cmd, path) {
+                    format!("{} is {}", cmd, path)
+                } else {
+                    format!("{}: not found", cmd)
+                }
+            },
+        ),
         "pwd" => std::env::current_dir().unwrap().display().to_string(),
-        "cd" => match args.next() {
-            Some(path) => match PathBuf::try_from(path.replace('~', &env::var("HOME")?)) {
-                Ok(path_buf) => match Shell::change_dir(&path_buf) {
-                    Ok(_) => String::default(),
-                    Err(e) => match e.kind() {
-                        std::io::ErrorKind::NotFound => { format!("cd: {}: No such file or directory", path_buf.display()) }
-                        std::io::ErrorKind::PermissionDenied => { format!("cd: permission denied: {}", path_buf.display()) }
-                        _ => format!("cd: error changing to {}: {}", path_buf.display(), e),
-                    },
+        "cd" => {
+            let target_path = args
+                .next()
+                .map(|p| p.replace('~', &env::var("HOME").unwrap()))
+                .unwrap_or_else(|| env::var("HOME").unwrap_or_default());
+            let path_buf = PathBuf::from(target_path);
+
+            if path_buf.as_os_str().is_empty() {
+                return Ok("cd: HOME environment variable not set".to_string());
+            }
+
+            Shell::change_dir(&path_buf).map_or_else(
+                |e| match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        format!("cd: {}: No such file or directory", path_buf.display())
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        format!("cd: permission denied: {}", path_buf.display())
+                    }
+                    _ => format!("cd: error changing to {}: {}", path_buf.display(), e),
                 },
-                Err(_) => format!("cd: invalid path '{}'", path),
-            },
-            None => match env::var("HOME") {
-                Ok(home) => match env::set_current_dir(Path::new(&home)) {
-                    Ok(_) => String::default(),
-                    Err(e) => format!("cd: error changing to home directory: {}", e),
-                },
-                Err(_) => "cd: HOME environment variable not set".to_string(),
-            },
-        },
+                |_| String::default(),
+            )
+        }
 
         otherwise => Command::get_command_path(otherwise, path)
             .map(|path| {
@@ -178,11 +181,7 @@ fn parse(input: String, path: &[PathBuf]) -> Result<String> {
 }
 
 fn is_executable(path: &PathBuf) -> bool {
-    if let Ok(metadata) = fs::metadata(path) {
-        let permissions = metadata.permissions();
-        let mode = permissions.mode();
-        mode & 0o111 != 0
-    } else {
-        false
-    }
+    fs::metadata(path).map(|metadata| {
+        metadata.permissions().mode() & 0o111 != 0
+    }).unwrap_or(false)
 }
